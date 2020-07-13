@@ -169,6 +169,12 @@ iperf_get_test_fqrate(struct iperf_test *ipt)
     return ipt->settings->fqrate;
 }
 
+uint64_t
+iperf_get_test_read_rate(struct iperf_test *ipt)
+{
+    return ipt->settings->read_rate;
+}
+
 int
 iperf_get_test_pacing_timer(struct iperf_test *ipt)
 {
@@ -416,6 +422,12 @@ void
 iperf_set_test_fqrate(struct iperf_test *ipt, uint64_t fqrate)
 {
     ipt->settings->fqrate = fqrate;
+}
+
+void
+iperf_set_test_read_rate(struct iperf_test *ipt, uint64_t read_rate)
+{
+    ipt->settings->read_rate = read_rate;
 }
 
 void
@@ -773,9 +785,14 @@ iperf_on_connect(struct iperf_test *test)
 	    else {
 		cJSON_AddNumberToObject(test->json_start, "tcp_mss_default", test->ctrl_sck_mss);
 	    }
+            if (test->settings->read_rate) {
+                cJSON_AddNumberToObject(test->json_start,
+                                        "target_read_bitrate",
+                                        test->settings->read_rate);
+            }
+        }
         if (test->settings->rate)
             cJSON_AddNumberToObject(test->json_start, "target_bitrate", test->settings->rate);
-        }
     } else if (test->verbose) {
         iperf_printf(test, report_cookie, test->cookie);
         if (test->protocol->id == SOCK_STREAM) {
@@ -787,6 +804,8 @@ iperf_on_connect(struct iperf_test *test)
         }
         if (test->settings->rate)
             iperf_printf(test, "      Target Bitrate: %"PRIu64"\n", test->settings->rate);
+        if (test->protocol->id == SOCK_STREAM && test->settings->read_rate)
+            iperf_printf(test, "      Target Read Bitrate: %"PRIu64"\n", test->settings->read_rate);
     }
 }
 
@@ -816,6 +835,7 @@ iperf_parse_arguments(struct iperf_test *test, int argc, char **argv)
         {"udp", no_argument, NULL, 'u'},
         {"bitrate", required_argument, NULL, 'b'},
         {"bandwidth", required_argument, NULL, 'b'},
+        {"read-bitrate", required_argument, NULL, OPT_READRATE},
         {"time", required_argument, NULL, 't'},
         {"bytes", required_argument, NULL, 'n'},
         {"blockcount", required_argument, NULL, 'k'},
@@ -1000,6 +1020,10 @@ iperf_parse_arguments(struct iperf_test *test, int argc, char **argv)
                 test->settings->rate = unit_atof_rate(optarg);
 		rate_flag = 1;
 		client_flag = 1;
+                break;
+            case OPT_READRATE:
+                test->settings->read_rate = unit_atof_rate(optarg);
+                client_flag = 1;
                 break;
             case 't':
                 test->duration = atoi(optarg);
@@ -1491,14 +1515,36 @@ iperf_send(struct iperf_test *test, fd_set *write_setP)
     return 0;
 }
 
+void
+iperf_check_read_throttle(struct iperf_stream *sp, struct iperf_time *nowP)
+{
+    struct iperf_time temp_time;
+    double seconds;
+    uint64_t bits_per_second;
+
+    if (sp->test->done || sp->test->settings->read_rate == 0)
+        return;
+    iperf_time_diff(&sp->result->start_time_fixed, nowP, &temp_time);
+    seconds = iperf_time_in_secs(&temp_time);
+    bits_per_second = sp->result->bytes_received * 8 / seconds;
+    if (bits_per_second < sp->test->settings->read_rate) {
+        sp->read_green_light = 1;
+    } else {
+        sp->read_green_light = 0;
+    }
+}
+
 int
 iperf_recv(struct iperf_test *test, fd_set *read_setP)
 {
     int r;
     struct iperf_stream *sp;
+    struct iperf_time now;
 
+    if (test->settings->read_rate != 0)
+        iperf_time_now(&now);
     SLIST_FOREACH(sp, &test->streams, streams) {
-	if (FD_ISSET(sp->socket, read_setP) && !sp->sender) {
+	if (sp->read_green_light && FD_ISSET(sp->socket, read_setP) && !sp->sender) {
 	    if ((r = sp->rcv(sp)) < 0) {
 		i_errno = IESTREAMREAD;
 		return r;
@@ -1506,6 +1552,7 @@ iperf_recv(struct iperf_test *test, fd_set *read_setP)
 	    test->bytes_received += r;
 	    ++test->blocks_received;
 	    FD_CLR(sp->socket, read_setP);
+	    iperf_check_read_throttle(sp, &now);
 	}
     }
 
@@ -1550,6 +1597,19 @@ send_timer_proc(TimerClientData client_data, struct iperf_time *nowP)
     iperf_check_throttle(sp, nowP);
 }
 
+static void
+receive_timer_proc(TimerClientData client_data, struct iperf_time *nowP)
+{
+    struct iperf_stream *sp = client_data.p;
+
+    /* All we do here is set or clear the flag saying that this stream may
+    ** be read from.  The actual reading gets done in the receive proc, after
+    ** checking the flag.
+    */
+    iperf_check_read_throttle(sp, nowP);
+}
+
+
 int
 iperf_create_send_timers(struct iperf_test * test)
 {
@@ -1567,6 +1627,31 @@ iperf_create_send_timers(struct iperf_test * test)
 	    cd.p = sp;
 	    sp->send_timer = tmr_create(NULL, send_timer_proc, cd, test->settings->pacing_timer, 1);
 	    if (sp->send_timer == NULL) {
+	        i_errno = IEINITTEST;
+	        return -1;
+	    }
+	}
+    }
+    return 0;
+}
+
+int
+iperf_create_receive_timers(struct iperf_test * test)
+{
+    struct iperf_time now;
+    struct iperf_stream *sp;
+    TimerClientData cd;
+
+    if (iperf_time_now(&now) < 0) {
+	i_errno = IEINITTEST;
+	return -1;
+    }
+    SLIST_FOREACH(sp, &test->streams, streams) {
+        sp->read_green_light = 1;
+	if (test->settings->read_rate != 0) {
+	    cd.p = sp;
+	    sp->recv_timer = tmr_create(NULL, receive_timer_proc, cd, test->settings->pacing_timer, 1);
+	    if (sp->recv_timer == NULL) {
 		i_errno = IEINITTEST;
 		return -1;
 	    }
@@ -1733,6 +1818,8 @@ send_parameters(struct iperf_test *test)
 	    cJSON_AddNumberToObject(j, "len", test->settings->blksize);
 	if (test->settings->rate)
 	    cJSON_AddNumberToObject(j, "bandwidth", test->settings->rate);
+	if (test->settings->read_rate)
+	    cJSON_AddNumberToObject(j, "read_rate", test->settings->read_rate);
 	if (test->settings->fqrate)
 	    cJSON_AddNumberToObject(j, "fqrate", test->settings->fqrate);
 	if (test->settings->pacing_timer)
@@ -1841,6 +1928,8 @@ get_parameters(struct iperf_test *test)
 	    test->settings->blksize = j_p->valueint;
 	if ((j_p = cJSON_GetObjectItem(j, "bandwidth")) != NULL)
 	    test->settings->rate = j_p->valueint;
+	if ((j_p = cJSON_GetObjectItem(j, "read_rate")) != NULL)
+	    test->settings->read_rate = j_p->valueint;
 	if ((j_p = cJSON_GetObjectItem(j, "fqrate")) != NULL)
 	    test->settings->fqrate = j_p->valueint;
 	if ((j_p = cJSON_GetObjectItem(j, "pacing_timer")) != NULL)
@@ -2357,6 +2446,7 @@ iperf_defaults(struct iperf_test *testp)
     testp->settings->socket_bufsize = 0;    /* use autotuning */
     testp->settings->blksize = DEFAULT_TCP_BLKSIZE;
     testp->settings->rate = 0;
+    testp->settings->read_rate = 0;
     testp->settings->fqrate = 0;
     testp->settings->pacing_timer = 1000;
     testp->settings->burst = 0;
@@ -2621,6 +2711,7 @@ iperf_reset_test(struct iperf_test *test)
     test->settings->socket_bufsize = 0;
     test->settings->blksize = DEFAULT_TCP_BLKSIZE;
     test->settings->rate = 0;
+    test->settings->read_rate = 0;
     test->settings->burst = 0;
     test->settings->mss = 0;
     test->settings->tos = 0;
@@ -3639,6 +3730,8 @@ iperf_free_stream(struct iperf_stream *sp)
     free(sp->result);
     if (sp->send_timer != NULL)
 	tmr_cancel(sp->send_timer);
+    if (sp->recv_timer != NULL)
+	tmr_cancel(sp->recv_timer);
     free(sp);
 }
 

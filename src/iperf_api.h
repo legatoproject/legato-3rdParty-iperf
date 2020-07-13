@@ -73,6 +73,7 @@ struct iperf_time;
 #define OPT_REPEATING_PAYLOAD 18
 #define OPT_EXTRA_DATA 19
 #define OPT_BIDIRECTIONAL 20
+#define OPT_READRATE 21
 
 /* states */
 #define TEST_START 1
@@ -271,6 +272,7 @@ void usage_long(FILE * f);
 void warning(const char *);
 int iperf_exchange_results(struct iperf_test *);
 int iperf_init_test(struct iperf_test *);
+int iperf_create_receive_timers(struct iperf_test *);    
 int iperf_create_send_timers(struct iperf_test *);
 int iperf_parse_arguments(struct iperf_test *, int, char **);
 int iperf_open_logfile(struct iperf_test *);

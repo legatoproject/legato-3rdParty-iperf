@@ -137,6 +137,7 @@ struct iperf_settings
     int       blksize;              /* size of read/writes (-l) */
     uint64_t  rate;                 /* target data rate for application pacing*/
     uint64_t  fqrate;               /* target data rate for FQ pacing*/
+    uint64_t  read_rate;            /* target data read rate for application pacing */
     int	      pacing_timer;	    /* pacing timer in microseconds */
     int       burst;                /* packets per burst */
     int       mss;                  /* for TCP MSS */
@@ -176,6 +177,8 @@ struct iperf_stream
     struct iperf_stream_result *result;	/* structure pointer to result */
     Timer     *send_timer;
     int       green_light;
+    Timer     *recv_timer;
+    int       read_green_light;
     int       buffer_fd;	/* data to send, file descriptor */
     char      *buffer;		/* data to send, mmapped */
     int       diskfile_fd;	/* file to send, file descriptor */
