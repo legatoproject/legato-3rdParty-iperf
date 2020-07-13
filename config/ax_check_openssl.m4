@@ -63,7 +63,7 @@ AC_DEFUN([AX_CHECK_OPENSSL], [
 
             # no such luck; use some default ssldirs
             if ! $found; then
-                ssldirs="/usr/local/ssl /usr/lib/ssl /usr/ssl /usr/pkg /usr/local /usr"
+                ssldirs="$lt_sysroot/usr/local/ssl $lt_sysroot/usr/lib/ssl $lt_sysroot/usr/ssl $lt_sysroot/usr/pkg $lt_sysroot/usr/local $lt_sysroot/usr"
             fi
         ]
         )
